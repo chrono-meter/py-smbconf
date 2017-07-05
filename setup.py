@@ -28,58 +28,114 @@ import Cython.Compiler.Options
 Cython.Compiler.Options.annotate = True
 from distutils.core import setup
 from distutils.extension import Extension
+from distutils.command.build_ext import build_ext
 from Cython.Build import cythonize
 from pathlib import Path
 import subprocess
+import shlex
+import re
 
 
-def find_file(pattern):
-    root = Path('/usr')  # list(Path.cwd().parents)[-1]
-    for result in root.rglob(pattern):
-        return result
-    raise RuntimeError('"%s" is not found. Please run "apt install samba-dev" or "yum install samba-devel", else install Samba from source.' % (pattern, ))
+def find_exe(exe_name, path=None):
+    """Find executable file by `which` command, else try to find in `path` argument.
+    """
+    try:
+        result = Path(subprocess.check_output(['which', str(exe_name)], universal_newlines=True).strip())
+    except subprocess.CalledProcessError:
+        pass
+    else:
+        if result.exists():
+            return result
+
+    for dirname in path or ():
+        result = Path(dirname) / exe_name
+        if result.exists():
+            return result
+
+    raise FileNotFoundError(exe_name)
 
 
-include_dir = find_file('smbconf.h').parent
-libsmbd_base = find_file('libsmbd-base*.so*')  # The correct package name is "samba-lib".
+def find_dependencies(exe_name, lib_names):
+    """Get dependency shared objects from `exe_name` by `ldd` command, then return shortest matches with `lib_names`.
+    """
+    result = {}
 
-try:
-    subprocess.check_call('/sbin/ldconfig -p | grep libsmbd-base', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-except subprocess.CalledProcessError:
-    raise RuntimeError('"libsmbd-base" is not found in ldconfig. Example solution: 1. find the correct path of "libsmbd-base*.so*". 2. add the path into "/etc/ld.so.conf.d/samba.conf". 3. run "sudo ldconfig".')
+    for line in subprocess.check_output(['ldd', str(exe_name)], universal_newlines=True).splitlines():
+        m = re.search(r'(\S+)\s+=>\s+(\S+)\s+\(0x[0-9A-Fa-f]+\)', line)
+        if m:
+            lib_name, lib_path = m.groups()
+            for needed in lib_names:
+                if needed in lib_name:
+                    result.setdefault(needed, []).append(Path(lib_path))
+
+    return {lib_name: sorted(lib_paths, key=lambda x: x.name.split('.')[0])[0] for lib_name, lib_paths in result.items()}
 
 
-extensions = [
-    Extension(
-        "smbconf",
-        ["src/smbconf.pyx"],
-        include_dirs=[
-            str(include_dir),
-        ],
-        libraries=[
-            "talloc",
+class build_ext(build_ext):
+    """Fire `distribution.ext_modules.finalize_options`.
+    """
+
+    def finalize_options(self):
+        for x in self.distribution.ext_modules:
+            if getattr(x, 'finalize_options'):
+                x.finalize_options(self)
+
+        super().finalize_options()
+
+
+class Extension(Extension):
+
+    @classmethod
+    def create(cls, *args, pkg_config=None, exe_name=None, search_path=(), lib_names=(), **kwargs):
+        """Cython-0.25.2 doesn't support set additional parameter via __init__.
+        """
+        cls = type(cls.__name__, (cls, ), {})
+        cls.pkg_config = pkg_config
+        cls.exe_name = exe_name
+        cls.search_path = search_path
+        cls.lib_names = lib_names
+        return cls(*args, **kwargs)
+
+    def finalize_options(self, cmd):
+        # usage: setup.py build_ext --include-dirs /path/to/includes --libraries lib1,lib2 --library-dirs /path/to/libs --rpath /path/to/libs install
+
+        if not any([cmd.distribution.include_dirs, cmd.include_dirs]) and self.pkg_config:
+            # get compiler flags from pkg-config.
+            self.include_dirs.extend(
+                x[2:] for x in shlex.split(subprocess.check_output(['pkg-config', '--cflags-only-I', self.pkg_config], universal_newlines=True))
+            )
+
+        if not any([cmd.library_dirs, cmd.libraries, cmd.rpath]) and self.lib_names:
+            # ctypes.util.find_library uses ldconfig and ld. So try to find libraries from executable file.
+            dependency = find_dependencies(find_exe(self.exe_name, self.search_path), lib_names=self.lib_names)
+
+            library_dirs = list({str(x.parent) for x in dependency.values()})
+            libraries = [':' + x.name for x in dependency.values()]
+
+            self.library_dirs.extend(library_dirs)
+            self.runtime_library_dirs.extend(library_dirs)
+            self.libraries.extend(libraries)
+
+
+if __name__ == '__main__':
+    extensions = [
+        Extension.create(
             "smbconf",
-            # libsmbd_base.name.split('.')[0][3:],  # apt: smbd-base, rpm: smbd-base-samba4
-        ],
-        extra_compile_args=["-g", "-O0"],
-        extra_link_args=[
-            "-L" + str(libsmbd_base.parent),
-            "-Wl,-rpath",
-            "-Wl," + str(libsmbd_base.parent),
-            # "-ltalloc",
-            # "-lsmbconf",
-            # "-lsmbd-base-samba4",
-            "-l:" + libsmbd_base.name,  # apt: /usr/lib/x86_64-linux-gnu/samba/libsmbd-base.so.0, rpm: /usr/lib64/samba/libsmbd-base-samba4.so
-        ],
-    ),
-]
+            ["src/smbconf.pyx"],
+            extra_compile_args=["-g", "-O0"],
+            pkg_config='samba-hostconfig',
+            exe_name='smbd',
+            search_path=('/sbin', '/usr/sbin', '/usr/local/sbin'),
+            lib_names=('talloc', 'smbconf', 'smbd-base'),
+        ),
+    ]
 
-
-setup(
-    name='smbconf',
-    version='1.0',
-    packages=[''],
-    package_dir={'': 'src'},
-    package_data={'': ['*.html', '*.c']},
-    ext_modules=cythonize(extensions)
-)
+    setup(
+        name='smbconf',
+        version='1.0',
+        packages=[''],
+        package_dir={'': 'src'},
+        package_data={'': ['*.html', '*.c']},
+        ext_modules=cythonize(extensions),
+        cmdclass={'build_ext': build_ext},
+    )
